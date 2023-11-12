@@ -103,6 +103,9 @@ class OPTLayer(nn.Module):
     def forward(self, h, k_cache, v_cache):
         r = h
         if self.do_layer_norm_before:
+            print(self.self_attn_layer_norm.weight.data.dtype)
+            print(self.self_attn_layer_norm.bias.data.dtype)
+            print(h.dtype)
             h = self.self_attn_layer_norm(h)
         h = self.self_attn(h, k_cache, v_cache)
         h = r + h
@@ -147,9 +150,9 @@ class OPTDecoder(nn.Module):
             self.proj_out = None
 
         if self.do_layer_norm_before:
-            self.final_lyaer_norm = nn.LayerNorm(self.hidden_size)
+            self.final_layer_norm = nn.LayerNorm(self.hidden_size)
         else:
-            self.final_lyaer_norm = None
+            self.final_layer_norm = None
 
         self.layers = nn.ModuleList(
             [
@@ -170,8 +173,8 @@ class OPTDecoder(nn.Module):
                 h = self.layers[i](h, k_cache[i], v_cache[i])
             else:
                 h = self.layers[i](h, None, None)
-        if self.final_lyaer_norm is not None:
-            h = self.final_lyaer_norm(h)
+        if self.final_layer_norm is not None:
+            h = self.final_layer_norm(h)
         if self.proj_out is not None:
             h = self.proj_out(h)
         return h
@@ -183,26 +186,73 @@ class OPTDecoder(nn.Module):
          'model.decoder.final_layer_norm.bias',
          'lm_head.weight']
         model_dict = torch.load(model_bin_path)
-        self.embed_tokens.weight = model_dict["model.decoder.embed_tokens.weight"]
-        self.position_tokens.weight = model_dict["model.decoder.embed_positions.weight"]
+        self.embed_tokens.weight.data = model_dict["model.decoder.embed_tokens.weight"].cuda()
+        self.position_tokens.weight.data = model_dict["model.decoder.embed_positions.weight"].cuda()
 
         if self.final_layer_norm is not None:
-            self.final_lyaer_norm.weight = model_dict["model.decoder.final_layer_norm.weight"]
-            self.final_layer_norm.bias = model_dict["model.decoder.final_layer_norm.bias"]
+            self.final_layer_norm.weight.data = model_dict["model.decoder.final_layer_norm.weight"].cuda()
+            self.final_layer_norm.bias.data = model_dict["model.decoder.final_layer_norm.bias"].cuda()
 
-        for name, weight in model_bin_path.items():
+        for name, weight in model_dict.items():
             if name in not_layers:
                 continue
             splitted_names = name.split('.')
             splitted_names = splitted_names[3:]
             layer_num = int(splitted_names[0])
-            print(layer_num)
+            splitted_names = splitted_names[1:]
+            module_name = splitted_names[0]
+            splitted_names = splitted_names[1:]
+            if module_name == "self_attn":
+                proj = splitted_names[0]
+                splitted_names = splitted_names[1:]
+                wb = splitted_names[0]
+                if proj == "q_proj":
+                    if wb == "weight":
+                        self.layers[layer_num].self_attn.q_proj.weight.data = weight
+                    else:
+                        self.layers[layer_num].self_attn.q_proj.bias.data = weight
+                elif proj == "k_proj":
+                    if wb == "weight":
+                        self.layers[layer_num].self_attn.k_proj.weight.data = weight
+                    else:
+                        self.layers[layer_num].self_attn.k_proj.bias.data = weight
+                elif proj == "v_proj":
+                    if wb == "weight":
+                        self.layers[layer_num].self_attn.v_proj.weight.data = weight
+                    else:
+                        self.layers[layer_num].self_attn.v_proj.bias.data = weight
+            elif module_name == "self_attn_layer_norm":
+                wb = splitted_names[0]
+                if wb == "weight":
+                    print(weight.dtype)
+                    self.layers[layer_num].self_attn_layer_norm.weight.data = weight
+                else:
+                    self.layers[layer_num].self_attn_layer_norm.bias.data = weight
+            elif module_name == "fc1":
+                wb = splitted_names[0]
+                if wb == "weight":
+                    self.layers[layer_num].fc1.weight.data = weight
+                else:
+                    self.layers[layer_num].fc1.bias.data = weight
+            elif module_name == "fc2":
+                wb = splitted_names[0]
+                if wb == "weight":
+                    self.layers[layer_num].fc2.weight.data = weight
+                else:
+                    self.layers[layer_num].fc2.bias.data = weight
+            elif module_name == "final_layer_norm":
+                wb = splitted_names[0]
+                if wb == "weight":
+                    self.layers[layer_num].final_layer_norm.weight.data = weight
+                else:
+                    self.layers[layer_num].final_layer_norm.bias.data = weight
 
 if __name__ == "__main__":
     with open("opt-125m/config.json", 'r') as f:
         config = json.load(f)
-    model = OPTDecoder(config).cuda()
-
+    model = OPTDecoder(config)
+    model.load_weights("opt-125m/pytorch_model.bin")
+    model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained("./opt-125m/")
     token_ids = tokenizer.encode("I am a gay")
     token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
