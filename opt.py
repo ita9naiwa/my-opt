@@ -79,9 +79,8 @@ class OPTAttention(nn.Module):
         else:
             batch_size = q.size(0)
             context_size = q.size(1)
-            mask = torch.from_numpy(np.tril(np.ones(context_size).astype(np.float32))).reshape(1, context_size, context_size).repeat(batch_size, 1, 1).cuda()
+            mask = torch.from_numpy(np.tril(np.ones(context_size).astype(np.float16))).reshape(1, context_size, context_size).repeat(batch_size, 1, 1).cuda()
             _, _, o = naive_attention_forward(q, k, v, mask, self.num_heads)
-
         o_proj = self.out_proj(o)
         return o_proj
 
@@ -103,9 +102,6 @@ class OPTLayer(nn.Module):
     def forward(self, h, k_cache, v_cache):
         r = h
         if self.do_layer_norm_before:
-            print(self.self_attn_layer_norm.weight.data.dtype)
-            print(self.self_attn_layer_norm.bias.data.dtype)
-            print(h.dtype)
             h = self.self_attn_layer_norm(h)
         h = self.self_attn(h, k_cache, v_cache)
         h = r + h
@@ -221,10 +217,14 @@ class OPTDecoder(nn.Module):
                         self.layers[layer_num].self_attn.v_proj.weight.data = weight
                     else:
                         self.layers[layer_num].self_attn.v_proj.bias.data = weight
+                elif proj == "out_proj":
+                    if wb == "weight":
+                        self.layers[layer_num].self_attn.out_proj.weight.data = weight
+                    else:
+                        self.layers[layer_num].self_attn.out_proj.bias.data = weight
             elif module_name == "self_attn_layer_norm":
                 wb = splitted_names[0]
                 if wb == "weight":
-                    print(weight.dtype)
                     self.layers[layer_num].self_attn_layer_norm.weight.data = weight
                 else:
                     self.layers[layer_num].self_attn_layer_norm.bias.data = weight
@@ -254,9 +254,12 @@ if __name__ == "__main__":
     model.load_weights("opt-125m/pytorch_model.bin")
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained("./opt-125m/")
-    token_ids = tokenizer.encode("I am a gay")
-    token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
-    positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
-    with torch.no_grad():
-        ret = model.forward(token_ids, positions, None, None)
-        ret.shape
+    token_ids = tokenizer.encode("I am a")
+    for i in range(128):
+        _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
+        positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
+        ret = model.forward(_token_ids, positions, None, None)
+        ret = torch.matmul(model.embed_tokens.weight.data, ret[0][-1])
+        argm = ret.argmax()
+        token_ids.append(argm)
+    print(tokenizer.decode(token_ids))
