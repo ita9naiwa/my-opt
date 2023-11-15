@@ -40,18 +40,6 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
     def forward(self, positions: torch.Tensor):
         return super().forward(positions + self.offset)
 
-
-class OPTLearnedPositionalEmbedding(nn.Embedding):
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        # OPT is set up so that if padding_idx is specified then offset the
-        # embedding ids by 2 and adjust num_embeddings appropriately. Other
-        # models don't have this hack
-        self.offset = 2
-        super().__init__(num_embeddings + self.offset, embedding_dim)
-
-    def forward(self, positions: torch.Tensor):
-        return super().forward(positions + self.offset)
-
 class OPTAttention(nn.Module):
     def __init__(
         self,
@@ -248,13 +236,15 @@ class OPTDecoder(nn.Module):
                     self.layers[layer_num].final_layer_norm.bias.data = weight
 
 if __name__ == "__main__":
-    with open("opt-125m/config.json", 'r') as f:
+    from os.path import join as pjoin
+    model_name = "opt-125m"
+    with open(pjoin(model_name, "config.json"), 'r') as f:
         config = json.load(f)
     model = OPTDecoder(config)
-    model.load_weights("opt-125m/pytorch_model.bin")
+    model.load_weights(pjoin(model_name, "pytorch_model.bin"))
     model = model.cuda()
-    tokenizer = AutoTokenizer.from_pretrained("./opt-125m/")
-    token_ids = tokenizer.encode("I am a")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    token_ids = tokenizer.encode("gay sex")
     for i in range(128):
         _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
         positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
