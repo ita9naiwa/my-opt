@@ -10,6 +10,7 @@ class CacheManager:
         self.k_cache = None
         self.v_cache = None
         self.empty_slot = []
+        self.init_cache()
 
     def init_cache(self):
         self.v_cache = [
@@ -18,7 +19,7 @@ class CacheManager:
         self.k_cache = [
             torch.zeros(self.num_tokens, self.embed_dim).cuda()
             for _ in range(self.n_layers)]
-        self.empty_slot = list(range(self.num_tokens))
+        self.empty_slot = list(reversed(range(self.num_tokens)))
 
     def get_slots(self, size=1):
         if len(self.empty_slot) < size:
@@ -37,3 +38,6 @@ class CacheManager:
             self.empty_slot.append(slot)
         elif isinstance(slot, list):
             self.empty_slot.extend(slot)
+
+    def step(self):
+        

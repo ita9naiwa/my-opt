@@ -87,7 +87,7 @@ class OPTLayer(nn.Module):
         self.fc2 = nn.Linear(self.ffn_dim, self.embed_dim, bias=bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
-    def forward(self, h, k_cache, v_cache):
+    def forward(self, h, k_cache, v_cache, prompt_init):
         r = h
         if self.do_layer_norm_before:
             h = self.self_attn_layer_norm(h)
@@ -145,7 +145,7 @@ class OPTDecoder(nn.Module):
             ]
         )
 
-    def forward(self, input_ids, positions, k_cache, v_cache):
+    def forward(self, input_ids, positions, k_cache, v_cache, prompt_init=True):
         emb = self.embed_tokens(input_ids)
         pos = self.position_tokens(positions)
         if self.proj_in is not None:
@@ -153,10 +153,8 @@ class OPTDecoder(nn.Module):
         h = emb + pos
 
         for i in range(self.num_hidden_layers):
-            if k_cache is not None:
-                h = self.layers[i](h, k_cache[i], v_cache[i])
-            else:
-                h = self.layers[i](h, None, None)
+            h = self.layers[i](h, k_cache[i], v_cache[i], prompt_init)
+
         if self.final_layer_norm is not None:
             h = self.final_layer_norm(h)
         if self.proj_out is not None:
@@ -237,6 +235,9 @@ class OPTDecoder(nn.Module):
 
 if __name__ == "__main__":
     from os.path import join as pjoin
+    from sampler import Sampler
+    s = Sampler(k=30, p=0.9, t=1.0)
+
     model_name = "opt-125m"
     with open(pjoin(model_name, "config.json"), 'r') as f:
         config = json.load(f)
@@ -244,12 +245,14 @@ if __name__ == "__main__":
     model.load_weights(pjoin(model_name, "pytorch_model.bin"))
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    token_ids = tokenizer.encode("gay sex")
-    for i in range(128):
-        _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
-        positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
-        ret = model.forward(_token_ids, positions, None, None)
-        ret = torch.matmul(model.embed_tokens.weight.data, ret[0][-1])
-        argm = ret.argmax()
-        token_ids.append(argm)
-    print(tokenizer.decode(token_ids))
+    token_ids = tokenizer.encode("I swim in the pool")
+    print(token_ids)
+
+    # for i in range(128):
+    #     _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
+    #     positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
+    #     ret = model.forward(_token_ids, positions, None, None)
+    #     ret = torch.matmul(model.embed_tokens.weight.data, ret[0][-1])
+    #     argm = ret.argmax()
+    #     token_ids.append(argm)
+    # print(tokenizer.decode(token_ids))
