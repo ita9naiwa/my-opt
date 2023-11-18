@@ -10,7 +10,7 @@ from torch import nn
 import numpy as np
 from transformers import AutoTokenizer
 
-from attention import naive_attention_forward, kv_attention_forward
+from paged_attention import paged_attention_forward, paged_kv_attention_forward
 
 OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "facebook/opt-125m",
@@ -58,17 +58,18 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    def forward(self, h, k_cache, v_cache):
+    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init=True):
         q = self.q_proj(h)
         k = self.k_proj(h)
         v = self.v_proj(h)
-        if k_cache is not None:
-            _, _, o = kv_attention_forward(q, k, v, k_cache, v_cache, self.num_heads)
+        # prompt init일 때랑 아닐 때랑 offsets, cache_indices의 목적이 다름
+        if prompt_init:
+            _, _, o = paged_attention_forward(q, k, v, offsets, self.num_heads)
+            print(o)
+            k_cache[cache_indices] = k
+            v_cache[cache_indices] = v
         else:
-            batch_size = q.size(0)
-            context_size = q.size(1)
-            mask = torch.from_numpy(np.tril(np.ones(context_size).astype(np.float16))).reshape(1, context_size, context_size).repeat(batch_size, 1, 1).cuda()
-            _, _, o = naive_attention_forward(q, k, v, mask, self.num_heads)
+            _, _, o = paged_kv_attention_forward(q, k, v, k_cache, v_cache, cache_indices, offsets, self.num_heads)
         o_proj = self.out_proj(o)
         return o_proj
 
@@ -87,11 +88,11 @@ class OPTLayer(nn.Module):
         self.fc2 = nn.Linear(self.ffn_dim, self.embed_dim, bias=bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
-    def forward(self, h, k_cache, v_cache, prompt_init):
+    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init):
         r = h
         if self.do_layer_norm_before:
             h = self.self_attn_layer_norm(h)
-        h = self.self_attn(h, k_cache, v_cache)
+        h = self.self_attn(h, k_cache, v_cache, offsets, cache_indices, prompt_init)
         h = r + h
 
         if not self.do_layer_norm_before: # 350m do layer norm after attention
@@ -145,7 +146,7 @@ class OPTDecoder(nn.Module):
             ]
         )
 
-    def forward(self, input_ids, positions, k_cache, v_cache, prompt_init=True):
+    def forward(self, input_ids, positions, k_cache, v_cache, offsets, cache_indices, prompt_init=True):
         emb = self.embed_tokens(input_ids)
         pos = self.position_tokens(positions)
         if self.proj_in is not None:
@@ -153,20 +154,21 @@ class OPTDecoder(nn.Module):
         h = emb + pos
 
         for i in range(self.num_hidden_layers):
-            h = self.layers[i](h, k_cache[i], v_cache[i], prompt_init)
+            h = self.layers[i](h, k_cache[i], v_cache[i], offsets, cache_indices, prompt_init)
 
         if self.final_layer_norm is not None:
             h = self.final_layer_norm(h)
         if self.proj_out is not None:
             h = self.proj_out(h)
+        # return h[offsets - 1]
         return h
 
     def load_weights(self, model_bin_path):
         not_layers = ['model.decoder.embed_tokens.weight',
-         'model.decoder.embed_positions.weight',
-         'model.decoder.final_layer_norm.weight',
-         'model.decoder.final_layer_norm.bias',
-         'lm_head.weight']
+                      'model.decoder.embed_positions.weight',
+                      'model.decoder.final_layer_norm.weight',
+                      'model.decoder.final_layer_norm.bias',
+                      'lm_head.weight']
         model_dict = torch.load(model_bin_path)
         self.embed_tokens.weight.data = model_dict["model.decoder.embed_tokens.weight"].cuda()
         self.position_tokens.weight.data = model_dict["model.decoder.embed_positions.weight"].cuda()
@@ -236,7 +238,7 @@ class OPTDecoder(nn.Module):
 if __name__ == "__main__":
     from os.path import join as pjoin
     from sampler import Sampler
-    s = Sampler(k=30, p=0.9, t=1.0)
+    s = Sampler(k=30, p=0.9, t=0.001)
 
     model_name = "opt-125m"
     with open(pjoin(model_name, "config.json"), 'r') as f:
@@ -245,14 +247,40 @@ if __name__ == "__main__":
     model.load_weights(pjoin(model_name, "pytorch_model.bin"))
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    token_ids = tokenizer.encode("I swim in the pool")
-    print(token_ids)
+    token_ids1 = tokenizer.encode("Motivation is important.")
+    token_ids2 = tokenizer.encode("We are ")
 
-    # for i in range(128):
-    #     _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
-    #     positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
-    #     ret = model.forward(_token_ids, positions, None, None)
-    #     ret = torch.matmul(model.embed_tokens.weight.data, ret[0][-1])
-    #     argm = ret.argmax()
-    #     token_ids.append(argm)
-    # print(tokenizer.decode(token_ids))
+    token_ids1 = torch.LongTensor(token_ids1)
+    token_ids2 = torch.LongTensor(token_ids2)
+    positions1 = torch.LongTensor(list(range(len(token_ids1))))
+    positions2 = torch.LongTensor(list(range(len(token_ids2))))
+
+    def build(list_of_token_ids):
+        offsets = torch.LongTensor([len(token_ids) for token_ids in list_of_token_ids]).int()
+        token_ids = torch.cat(list_of_token_ids)
+        positions = torch.cat([torch.LongTensor(list(range(len(token_ids)))) for token_ids in list_of_token_ids])
+        cache_indices = torch.arange(len(token_ids))
+        return (offsets.cuda(),
+                token_ids.cuda(),
+                positions.cuda(),
+                cache_indices.cuda())
+    offsets, token_ids, positions, cache_indices = build([token_ids1])
+    # print(offsets, token_ids, positions, cache_indices)
+    print("offsets", offsets)
+    print("token_ids", token_ids)
+    print("positions", positions)
+    print("cache_indices", cache_indices)
+    v_cache = [torch.zeros(1024, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    k_cache = [torch.zeros(1024, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    ret = model.forward(token_ids, positions, k_cache, v_cache, offsets, cache_indices, prompt_init=True)
+    de = tokenizer.batch_decode(s.sample(ret))
+    print(de)
+    # s.sample(ret[])
+    # # for i in range(128):
+    # #     _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
+    # #     positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
+    # #     ret = model.forward(_token_ids, positions, None, None)
+    # #     ret = torch.matmul(model.embed_tokens.weight.data, ret[0][-1])
+    # #     argm = ret.argmax()
+    # #     token_ids.append(argm)
+    # # print(tokenizer.decode(token_ids))
