@@ -160,8 +160,10 @@ class OPTDecoder(nn.Module):
             h = self.final_layer_norm(h)
         if self.proj_out is not None:
             h = self.proj_out(h)
-        # return h[offsets - 1]
-        return h
+        last_h = h[offsets - 1]
+        ret = torch.matmul(model.embed_tokens.weight.data, last_h.T).T
+        return ret
+
 
     def load_weights(self, model_bin_path):
         not_layers = ['model.decoder.embed_tokens.weight',
@@ -264,7 +266,7 @@ if __name__ == "__main__":
                 token_ids.cuda(),
                 positions.cuda(),
                 cache_indices.cuda())
-    offsets, token_ids, positions, cache_indices = build([token_ids1])
+    offsets, token_ids, positions, cache_indices = build([token_ids1, token_ids2])
     # print(offsets, token_ids, positions, cache_indices)
     print("offsets", offsets)
     print("token_ids", token_ids)
