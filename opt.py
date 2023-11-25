@@ -58,18 +58,31 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init=True):
+    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init=True, new_cache_indices=None):
         q = self.q_proj(h)
         k = self.k_proj(h)
         v = self.v_proj(h)
         # prompt init일 때랑 아닐 때랑 offsets, cache_indices의 목적이 다름
         if prompt_init:
-            _, _, o = paged_attention_forward(q, k, v, offsets, self.num_heads)
-            print(o)
             k_cache[cache_indices] = k
             v_cache[cache_indices] = v
+            s, p, o = paged_attention_forward(q, k, v, offsets, self.num_heads)
         else:
-            _, _, o = paged_kv_attention_forward(q, k, v, k_cache, v_cache, cache_indices, offsets, self.num_heads)
+            if new_cache_indices is None:
+                raise IndexError("if prompt init is False, "
+                                 "new_cache_inidces must be given.")
+            if q.mean() == torch.nan:
+                return
+            if k.mean() == torch.nan:
+                return
+
+            s, p, o = paged_kv_attention_forward(q, k, v,
+                                                 k_cache, v_cache,
+                                                 cache_indices,
+                                                 offsets,
+                                                 self.num_heads)
+            k_cache[new_cache_indices] = k
+            v_cache[new_cache_indices] = v
         o_proj = self.out_proj(o)
         return o_proj
 
@@ -82,19 +95,19 @@ class OPTLayer(nn.Module):
         self.activation = ACTIVATION_MAP[activation]
         self.do_layer_norm_before = do_layer_norm_before
 
-        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim, eps=1e-5)
         self.self_attn = OPTAttention(self.embed_dim, num_attention_heads)
         self.fc1 = nn.Linear(self.embed_dim, self.ffn_dim, bias=bias)
         self.fc2 = nn.Linear(self.ffn_dim, self.embed_dim, bias=bias)
-        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.final_layer_norm = nn.LayerNorm(self.embed_dim, eps=1e-5)
 
-    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init):
+    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init, new_cache_indices=None):
         r = h
         if self.do_layer_norm_before:
             h = self.self_attn_layer_norm(h)
-        h = self.self_attn(h, k_cache, v_cache, offsets, cache_indices, prompt_init)
-        h = r + h
+        h = self.self_attn(h, k_cache, v_cache, offsets, cache_indices, prompt_init, new_cache_indices)
 
+        h = r + h
         if not self.do_layer_norm_before: # 350m do layer norm after attention
             h = self.self_attn_layer_norm(h)
         r = h
@@ -146,7 +159,13 @@ class OPTDecoder(nn.Module):
             ]
         )
 
-    def forward(self, input_ids, positions, k_cache, v_cache, offsets, cache_indices, prompt_init=True):
+    def forward(self,
+                input_ids, positions,
+                k_cache, v_cache,
+                offsets,
+                cache_indices,
+                prompt_init=True,
+                new_cache_indices=None):
         emb = self.embed_tokens(input_ids)
         pos = self.position_tokens(positions)
         if self.proj_in is not None:
@@ -154,14 +173,17 @@ class OPTDecoder(nn.Module):
         h = emb + pos
 
         for i in range(self.num_hidden_layers):
-            h = self.layers[i](h, k_cache[i], v_cache[i], offsets, cache_indices, prompt_init)
+            h = self.layers[i](h, k_cache[i], v_cache[i],
+                               offsets, cache_indices, prompt_init, new_cache_indices)
 
         if self.final_layer_norm is not None:
             h = self.final_layer_norm(h)
         if self.proj_out is not None:
             h = self.proj_out(h)
-        last_h = h[offsets - 1]
-        ret = torch.matmul(model.embed_tokens.weight.data, last_h.T).T
+
+        if prompt_init:
+            h = h[offsets - 1]
+        ret = torch.matmul(model.embed_tokens.weight.data, h.T).T
         return ret
 
 
@@ -239,8 +261,10 @@ class OPTDecoder(nn.Module):
 
 if __name__ == "__main__":
     from os.path import join as pjoin
+    import os
+    import time
     from sampler import Sampler
-    s = Sampler(k=30, p=0.9, t=0.001)
+    s = Sampler(k=50, p=0.9, t=1.0)
 
     model_name = "opt-125m"
     with open(pjoin(model_name, "config.json"), 'r') as f:
@@ -249,40 +273,73 @@ if __name__ == "__main__":
     model.load_weights(pjoin(model_name, "pytorch_model.bin"))
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    token_ids1 = tokenizer.encode("Motivation is important.")
-    token_ids2 = tokenizer.encode("We are ")
 
-    token_ids1 = torch.LongTensor(token_ids1)
-    token_ids2 = torch.LongTensor(token_ids2)
-    positions1 = torch.LongTensor(list(range(len(token_ids1))))
-    positions2 = torch.LongTensor(list(range(len(token_ids2))))
+    v_cache = [torch.zeros(2048, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    k_cache = [torch.zeros(2048, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
 
-    def build(list_of_token_ids):
-        offsets = torch.LongTensor([len(token_ids) for token_ids in list_of_token_ids]).int()
-        token_ids = torch.cat(list_of_token_ids)
-        positions = torch.cat([torch.LongTensor(list(range(len(token_ids)))) for token_ids in list_of_token_ids])
-        cache_indices = torch.arange(len(token_ids))
-        return (offsets.cuda(),
-                token_ids.cuda(),
-                positions.cuda(),
-                cache_indices.cuda())
-    offsets, token_ids, positions, cache_indices = build([token_ids1, token_ids2])
-    # print(offsets, token_ids, positions, cache_indices)
-    print("offsets", offsets)
-    print("token_ids", token_ids)
-    print("positions", positions)
-    print("cache_indices", cache_indices)
-    v_cache = [torch.zeros(1024, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
-    k_cache = [torch.zeros(1024, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
-    ret = model.forward(token_ids, positions, k_cache, v_cache, offsets, cache_indices, prompt_init=True)
-    de = tokenizer.batch_decode(s.sample(ret))
-    print(de)
-    # s.sample(ret[])
-    # # for i in range(128):
-    # #     _token_ids = torch.LongTensor(token_ids).unsqueeze(0).cuda()
-    # #     positions = torch.LongTensor(list(range(len(token_ids)))).unsqueeze(0).cuda()
-    # #     ret = model.forward(_token_ids, positions, None, None)
-    # #     ret = torch.matmul(model.embed_tokens.weight.data, ret[0][-1])
-    # #     argm = ret.argmax()
-    # #     token_ids.append(argm)
-    # # print(tokenizer.decode(token_ids))
+    sentences = [
+        "I'll tell you a story:",
+        "This is my machine learning model.",
+    ]
+    generated_sentences = ["" for _ in range(len(sentences))]
+    total_sampled_tokens = [[] for _ in range(len(sentences))]
+
+    token_ids = [tokenizer.encode(sentence) for sentence in sentences]
+    cache_indices = [(256 * i + np.arange(len(tokens))).tolist() for (i, tokens) in enumerate(token_ids)]
+    # handle list of token ids at the prompt stage
+
+    def build_prompt_input(list_of_token_ids, list_of_cache_indices):
+        offsets = torch.from_numpy(np.cumsum([len(token_ids) for token_ids in list_of_token_ids])).int()
+        token_ids = np.concatenate(list_of_token_ids)
+        positions = np.concatenate([np.arange(len(token_ids)) for token_ids in list_of_token_ids])
+        cache_indices = np.concatenate(list_of_cache_indices)
+        return (torch.IntTensor(offsets).cuda(),
+                torch.IntTensor(token_ids).cuda(),
+                torch.IntTensor(positions).cuda(),
+                torch.IntTensor(cache_indices).cuda())
+
+    offsets, input_token_ids, input_positions, input_cache_indices = build_prompt_input(token_ids, cache_indices)
+
+    ret = model.forward(input_token_ids, input_positions, k_cache, v_cache, offsets, input_cache_indices, prompt_init=True)
+    sampled_tokens = s.sample(ret).cpu().numpy().tolist()
+    de = tokenizer.batch_decode(sampled_tokens)
+
+    for i in range(len(sentences)):
+        total_sampled_tokens[i].append(sampled_tokens[i])
+        generated_sentences[i] += de[i]
+        print("====================================================")
+        print("sentence ", i, sentences[i] + generated_sentences[i])
+        print("====================================================")
+
+    # # handle single token id at the generation stage
+    for i in range(512):
+        new_token_ids = sampled_tokens
+        def build_generation_input(sampled_tokens, list_of_cache_indices):
+            new_positions = [len(x) for x in list_of_cache_indices]
+            offsets = np.cumsum(new_positions).tolist()
+            cache_indices = np.concatenate(list_of_cache_indices).tolist()
+            new_cache_indices = [256 * i + len(cache_indices) for (i, cache_indices) in enumerate(list_of_cache_indices)]
+            return (torch.IntTensor(sampled_tokens).cuda(),
+                    torch.IntTensor(new_positions).cuda(),
+                    torch.IntTensor(offsets).cuda(),
+                    torch.IntTensor(cache_indices).cuda(),
+                    torch.IntTensor(new_cache_indices).cuda())
+        new_token_ids, new_positions, offsets, input_cache_indices, new_cache_indices = build_generation_input(new_token_ids, cache_indices)
+        ret = model.forward(new_token_ids, new_positions,
+                            k_cache, v_cache,
+                            offsets,
+                            input_cache_indices,
+                            prompt_init=False,
+                            new_cache_indices=new_cache_indices)
+        sampled_tokens = s.sample(ret).cpu().numpy().tolist()
+        de = tokenizer.batch_decode(sampled_tokens)
+        _nc = new_cache_indices.cpu().numpy().tolist()
+        os.system("clear")
+        for i in range(len(sentences)):
+            cache_indices[i].append(_nc[i])
+            total_sampled_tokens[i].append(sampled_tokens[i])
+            generated_sentences[i] += de[i]
+            print("====================================================")
+            print("sentence ", i, sentences[i] + generated_sentences[i])
+            print("====================================================")
+        # time.sleep(0.5)
