@@ -187,25 +187,33 @@ class OPTDecoder(nn.Module):
         return ret
 
 
-    def load_weights(self, model_bin_path):
-        not_layers = ['model.decoder.embed_tokens.weight',
-                      'model.decoder.embed_positions.weight',
-                      'model.decoder.final_layer_norm.weight',
-                      'model.decoder.final_layer_norm.bias',
-                      'lm_head.weight']
-        model_dict = torch.load(model_bin_path)
-        self.embed_tokens.weight.data = model_dict["model.decoder.embed_tokens.weight"].cuda()
-        self.position_tokens.weight.data = model_dict["model.decoder.embed_positions.weight"].cuda()
+    def load_weights(self, model_path):
+        not_layers = ['decoder.embed_tokens.weight',
+                      'decoder.embed_positions.weight',
+                      'decoder.final_layer_norm.weight',
+                      'decoder.final_layer_norm.bias',
+                      'decoder.project_out.weight',
+                      'decoder.project_in.weight',
+                      'lm_head.weight'
+                      ]
+        model_dict = torch.load(pjoin(model_path, "pytorch_model.bin"))
+        model_config = json.load(open(pjoin(model_path, "config.json"), 'r'))
 
+        if self.word_embed_proj_dim != self.hidden_size:
+            self.proj_in.weight.data = model_dict["decoder.project_in.weight"].cuda()
+            self.proj_out.weight.data = model_dict["decoder.project_out.weight"].cuda()
+
+        self.embed_tokens.weight.data = model_dict["decoder.embed_tokens.weight"].cuda()
+        self.position_tokens.weight.data = model_dict["decoder.embed_positions.weight"].cuda()
         if self.final_layer_norm is not None:
-            self.final_layer_norm.weight.data = model_dict["model.decoder.final_layer_norm.weight"].cuda()
-            self.final_layer_norm.bias.data = model_dict["model.decoder.final_layer_norm.bias"].cuda()
+            self.final_layer_norm.weight.data = model_dict["decoder.final_layer_norm.weight"].cuda()
+            self.final_layer_norm.bias.data = model_dict["decoder.final_layer_norm.bias"].cuda()
 
         for name, weight in model_dict.items():
             if name in not_layers:
                 continue
             splitted_names = name.split('.')
-            splitted_names = splitted_names[3:]
+            splitted_names = splitted_names[2:]
             layer_num = int(splitted_names[0])
             splitted_names = splitted_names[1:]
             module_name = splitted_names[0]
@@ -266,11 +274,11 @@ if __name__ == "__main__":
     from sampler import Sampler
     s = Sampler(k=50, p=0.9, t=1.0)
 
-    model_name = "opt-125m"
+    model_name = "opt-350m"
     with open(pjoin(model_name, "config.json"), 'r') as f:
         config = json.load(f)
     model = OPTDecoder(config)
-    model.load_weights(pjoin(model_name, "pytorch_model.bin"))
+    model.load_weights(pjoin(model_name))
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -279,7 +287,6 @@ if __name__ == "__main__":
 
     sentences = [
         "I'll tell you a story:",
-        "This is my machine learning model.",
     ]
     generated_sentences = ["" for _ in range(len(sentences))]
     total_sampled_tokens = [[] for _ in range(len(sentences))]
