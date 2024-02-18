@@ -12,7 +12,6 @@ class Sequence:
         self.generated_tokens = []
         self.generated_token_kv_indices = []
 
-
     def get_prompt_len(self):
         return len(self.prompt_tokens)
 

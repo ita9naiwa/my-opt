@@ -38,6 +38,12 @@ class Sampler():
         self.t = t
         self.filter_value = -10000.0
     def sample(self, logits, k=None, p=None, t=None):
+        ndim = logits.dim()
+        if ndim == 1:
+            logits = logits.unsqueeze(0)
+        elif ndim != 2:
+            raise ValueError("logits should be 1D or 2D tensor")
+
         if k is None:
             k = self.k
         if p is None:
@@ -66,11 +72,20 @@ class Sampler():
             indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
             logits[indices_to_remove] = self.filter_value
         ret = torch.multinomial(logits.softmax(dim=-1), num_samples=1).squeeze(-1)
+        if ndim == 1:
+            ret = ret.squeeze(0)
         return ret
 
 if __name__ == "__main__":
     batch_size = 3
     num_samples = 10
     sampler = Sampler()
+    print("non-batch case")
+    logits = torch.normal(mean=0, std=1.0, size=(num_samples,))
+    sample = sampler.sample(logits, k=30, p=0.7)
+    print("sampled", sample)
+
+    print("batched case")
     logits = torch.normal(mean=0, std=1.0, size=(batch_size, num_samples))
-    sampler.sample(logits, k=30, p=0.7)
+    sample = sampler.sample(logits, k=30, p=0.7)
+    print("sampled: ", sample)

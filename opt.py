@@ -75,7 +75,6 @@ class OPTAttention(nn.Module):
                 return
             if k.mean() == torch.nan:
                 return
-
             s, p, o = paged_kv_attention_forward(q, k, v,
                                                  k_cache, v_cache,
                                                  cache_indices,
@@ -282,19 +281,19 @@ if __name__ == "__main__":
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    v_cache = [torch.zeros(2048, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
-    k_cache = [torch.zeros(2048, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    v_cache = [torch.zeros(8192, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    k_cache = [torch.zeros(8192, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
 
     sentences = [
-        "I'll tell you a story:",
+        "Seoul is a city",
     ]
     generated_sentences = ["" for _ in range(len(sentences))]
     total_sampled_tokens = [[] for _ in range(len(sentences))]
 
     token_ids = [tokenizer.encode(sentence) for sentence in sentences]
     cache_indices = [(256 * i + np.arange(len(tokens))).tolist() for (i, tokens) in enumerate(token_ids)]
-    # handle list of token ids at the prompt stage
 
+    # handle list of token ids at the prompt stage
     def build_prompt_input(list_of_token_ids, list_of_cache_indices):
         offsets = torch.from_numpy(np.cumsum([len(token_ids) for token_ids in list_of_token_ids])).int()
         token_ids = np.concatenate(list_of_token_ids)
@@ -319,7 +318,7 @@ if __name__ == "__main__":
         print("====================================================")
 
     # # handle single token id at the generation stage
-    for i in range(512):
+    for i in range(1):
         new_token_ids = sampled_tokens
         def build_generation_input(sampled_tokens, list_of_cache_indices):
             new_positions = [len(x) for x in list_of_cache_indices]
@@ -332,15 +331,19 @@ if __name__ == "__main__":
                     torch.IntTensor(cache_indices).cuda(),
                     torch.IntTensor(new_cache_indices).cuda())
         new_token_ids, new_positions, offsets, input_cache_indices, new_cache_indices = build_generation_input(new_token_ids, cache_indices)
-        ret = model.forward(new_token_ids, new_positions,
+        print("new_token_ids", new_token_ids.shape)
+        ret = model.forward(new_token_ids,
+                            new_positions,
                             k_cache, v_cache,
                             offsets,
                             input_cache_indices,
                             prompt_init=False,
                             new_cache_indices=new_cache_indices)
         sampled_tokens = s.sample(ret).cpu().numpy().tolist()
+        print("sampled tokens", sampled_tokens)
         de = tokenizer.batch_decode(sampled_tokens)
         _nc = new_cache_indices.cpu().numpy().tolist()
+        break
         os.system("clear")
         for i in range(len(sentences)):
             cache_indices[i].append(_nc[i])
