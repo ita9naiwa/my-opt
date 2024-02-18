@@ -1,4 +1,3 @@
-
 class Sequence:
     def __init__(self, prompt_tokens, sample_option):
         assert isinstance(prompt_tokens, list)

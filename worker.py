@@ -50,10 +50,4 @@ class Worker():
 
 
 if __name__ == "__main__":
-    worker = Worker("opt-125m")
-    input = {
-        "prompt": "I am a gay.",
-        "args": {
-        }
-    }
     worker.query(input)

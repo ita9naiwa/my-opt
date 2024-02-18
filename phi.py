@@ -289,7 +289,7 @@ class PhiDecoder(nn.Module):
 
 if __name__ == "__main__":
     CACHE_SIZE = 1024
-    MAX_SEQ_SIZE = 128
+    MAX_SEQ_SIZE = 256
     model_name = "phi-1_5"
     with open(pjoin(model_name, "config.json"), 'r') as f:
             config = json.load(f)
@@ -305,10 +305,8 @@ if __name__ == "__main__":
     k_cache = [torch.zeros(CACHE_SIZE, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
 
     sentences = [
-"""
-```python
-def quicksort(array):
-""",
+    """Let me tell you a story: """,
+    """sex is fun """,
     ]
     generated_sentences = ["" for _ in range(len(sentences))]
     total_sampled_tokens = [[] for _ in range(len(sentences))]
