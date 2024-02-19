@@ -4,7 +4,7 @@ from os.path import join as pjoin
 from transformers import AutoTokenizer
 import torch
 
-from opt import OPTDecoder
+from models.opt import OPTDecoder
 from cache_manager import CacheManager
 from sequence import Sequence
 

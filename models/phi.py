@@ -52,9 +52,7 @@ class PhiRotaryEmbedding(nn.Module):
         else:
             return q, k
 
-QQ = []
-KK = []
-PP = []
+
 # Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -142,9 +140,6 @@ class PhiAttention(nn.Module):
                                                  self.num_heads)
             k_cache[new_cache_indices] = k
             v_cache[new_cache_indices] = v
-        QQ.append(q.cpu())
-        KK.append(k.cpu())
-        PP.append(p.cpu())
         o = self.dense(o)
         return o
 
@@ -291,7 +286,7 @@ if __name__ == "__main__":
     CACHE_SIZE = 1024
     MAX_SEQ_SIZE = 256
     model_name = "phi-1_5"
-    with open(pjoin(model_name, "config.json"), 'r') as f:
+    with open(pjoin('../', model_name, "config.json"), 'r') as f:
             config = json.load(f)
     from sampler import Sampler
     s = Sampler(k=50, p=0.9, t=1.0)
@@ -306,7 +301,6 @@ if __name__ == "__main__":
 
     sentences = [
     """Let me tell you a story: """,
-    """sex is fun """,
     ]
     generated_sentences = ["" for _ in range(len(sentences))]
     total_sampled_tokens = [[] for _ in range(len(sentences))]

@@ -270,7 +270,7 @@ if __name__ == "__main__":
     from os.path import join as pjoin
     import os
     import time
-    from sampler import Sampler
+    from models.sampler import Sampler
     s = Sampler(k=50, p=0.9, t=1.0)
 
     model_name = "opt-350m"
