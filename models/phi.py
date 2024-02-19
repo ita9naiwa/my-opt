@@ -15,14 +15,14 @@ from transformers import AutoTokenizer
 
 from paged_attention import paged_attention_forward, paged_kv_attention_forward
 
+from rotary_embedding import rotary_embedding_inplace
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Phi
-class PhiRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim, rot_dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
-        self.dim = dim
+        self.head_dim = head_dim
+        self.dim = rot_dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
@@ -38,28 +38,13 @@ class PhiRotaryEmbedding(nn.Module):
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
         freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1).to(dtype)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.register_buffer("cos_cached", freqs.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin().to(dtype), persistent=False)
 
     def forward(self, q, k, positions, return_cos_sin=False):
-        cos = self.cos_cached[positions]
-        sin = self.sin_cached[positions]
-        q = q * cos + rotate_half(q) * sin
-        k = k * cos + rotate_half(k) * sin
-        if return_cos_sin:
-            return cos, sin, q, k
-        else:
-            return q, k
-
-
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
+        rotary_embedding_inplace(q, k, positions, self.cos_cached, self.sin_cached,
+                                 self.head_dim)
+        return q, k
 
 class PhiAttention(nn.Module):
     def __init__(self, config):
@@ -72,7 +57,6 @@ class PhiAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.max_position_embeddings = getattr(config, "n_positions", 2048)
         self.num_key_value_heads = config["num_key_value_heads"]
-        # self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.rope_theta = config["rope_theta"]
         self.partial_rotary_factor = config["partial_rotary_factor"]
         self.qk_layernorm = config["qk_layernorm"]
@@ -94,12 +78,13 @@ class PhiAttention(nn.Module):
             self.k_layernorm = nn.LayerNorm(self.head_dim, eps=config["layer_norm_eps"],
                                             elementwise_affine=True,
                                             dtype=torch.float16)
-
-        self.rotary_emb = PhiRotaryEmbedding(
-            self.rotary_dim,
+        self.rotary_emb = RotaryEmbedding(
+            head_dim=self.head_dim,
+            rot_dim=self.rotary_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+
     def forward(self, h, k_cache, v_cache, positions, offsets, cache_indices,
                 prompt_init=True,
                 new_cache_indices=None,):
@@ -110,16 +95,7 @@ class PhiAttention(nn.Module):
         # if self.qk_layernorm:
         #     q = self.q_layernorm(q)
         #     k = self.k_layernorm(k)
-
-        q = q.view(-1, self.num_heads, self.head_dim).transpose(0, 1)
-        k = k.view(-1, self.num_heads, self.head_dim).transpose(0, 1)
-        q_rot, q_pass = (q[..., : self.rotary_dim], q[..., self.rotary_dim :])
-        k_rot, k_pass = (k[..., : self.rotary_dim], k[..., self.rotary_dim :])
-        q_rot, k_rot = self.rotary_emb(q_rot, k_rot, positions)
-        q = torch.cat((q_rot, q_pass), dim=-1).transpose(0, 1)
-        k = torch.cat((k_rot, k_pass), dim=-1).transpose(0, 1)
-        q = q.reshape(-1, self.hidden_size)
-        k = k.reshape(-1, self.hidden_size)
+        q, k = self.rotary_emb(q, k, positions)
         if prompt_init:
             k_cache[cache_indices] = k
             v_cache[cache_indices] = v
@@ -281,88 +257,3 @@ class PhiDecoder(nn.Module):
                     self.final_layer_norm.weight.data = weight
                 elif splitted[4] == "bias":
                     self.final_layer_norm.bias.data = weight
-
-if __name__ == "__main__":
-    CACHE_SIZE = 1024
-    MAX_SEQ_SIZE = 256
-    model_name = "phi-1_5"
-    with open(pjoin('../', model_name, "config.json"), 'r') as f:
-            config = json.load(f)
-    from sampler import Sampler
-    s = Sampler(k=50, p=0.9, t=1.0)
-
-    model = PhiDecoder(config)
-    model.load_weights(model_name)
-    model = model.cuda()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    v_cache = [torch.zeros(CACHE_SIZE, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
-    k_cache = [torch.zeros(CACHE_SIZE, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
-
-    sentences = [
-    """Let me tell you a story: """,
-    ]
-    generated_sentences = ["" for _ in range(len(sentences))]
-    total_sampled_tokens = [[] for _ in range(len(sentences))]
-
-    token_ids = [tokenizer.encode(sentence) for sentence in sentences]
-    cache_indices = [(MAX_SEQ_SIZE * i + np.arange(len(tokens))).tolist() for (i, tokens) in enumerate(token_ids)]
-    print("cache_indices", cache_indices)
-    # handle list of token ids at the prompt stage
-    def build_prompt_input(list_of_token_ids, list_of_cache_indices):
-        offsets = torch.from_numpy(np.cumsum([len(token_ids) for token_ids in list_of_token_ids])).int()
-        token_ids = np.concatenate(list_of_token_ids)
-        positions = np.concatenate([np.arange(len(token_ids)) for token_ids in list_of_token_ids])
-        cache_indices = np.concatenate(list_of_cache_indices)
-        return (torch.IntTensor(offsets).cuda(),
-                torch.IntTensor(token_ids).cuda(),
-                torch.IntTensor(positions).cuda(),
-                torch.IntTensor(cache_indices).cuda())
-
-    offsets, input_token_ids, input_positions, input_cache_indices = build_prompt_input(token_ids, cache_indices)
-
-    ret = model.forward(input_token_ids, input_positions, k_cache, v_cache, offsets, input_cache_indices, prompt_init=True)
-    sampled_tokens = s.sample(ret).cpu().numpy().tolist()
-    de = tokenizer.batch_decode(sampled_tokens)
-
-    for i in range(len(sentences)):
-        total_sampled_tokens[i].append(sampled_tokens[i])
-        generated_sentences[i] += de[i]
-        print("====================================================")
-        print("sentence ", i, sentences[i] + generated_sentences[i])
-        print("====================================================")
-
-    # # handle single token id at the generation stage
-    for i in range(MAX_SEQ_SIZE - 1):
-        new_token_ids = sampled_tokens
-        def build_generation_input(sampled_tokens, list_of_cache_indices):
-            new_positions = [len(x) for x in list_of_cache_indices]
-            offsets = np.cumsum(new_positions).tolist()
-            cache_indices = np.concatenate(list_of_cache_indices).tolist()
-            new_cache_indices = [MAX_SEQ_SIZE * i + len(cache_indices) for (i, cache_indices) in enumerate(list_of_cache_indices)]
-            return (torch.IntTensor(sampled_tokens).cuda(),
-                    torch.IntTensor(new_positions).cuda(),
-                    torch.IntTensor(offsets).cuda(),
-                    torch.IntTensor(cache_indices).cuda(),
-                    torch.IntTensor(new_cache_indices).cuda())
-        new_token_ids, new_positions, offsets, input_cache_indices, new_cache_indices = build_generation_input(new_token_ids, cache_indices)
-        ret = model.forward(new_token_ids,
-                            new_positions,
-                            k_cache, v_cache,
-                            offsets,
-                            input_cache_indices,
-                            prompt_init=False,
-                            new_cache_indices=new_cache_indices)
-        sampled_tokens = s.sample(ret).cpu().numpy().tolist()
-        de = tokenizer.batch_decode(sampled_tokens)
-        _nc = new_cache_indices.cpu().numpy().tolist()
-        os.system("clear")
-        for i in range(len(sentences)):
-            cache_indices[i].append(_nc[i])
-            total_sampled_tokens[i].append(sampled_tokens[i])
-            generated_sentences[i] += de[i]
-            print("====================================================")
-            print("sentence ", i, sentences[i] + generated_sentences[i])
-            print("====================================================")
-
-    #     # time.sleep(0.5)
