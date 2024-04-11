@@ -13,9 +13,7 @@ from os.path import join as pjoin
 
 from transformers import AutoTokenizer
 
-from paged_attention import paged_attention_forward, paged_kv_attention_forward
-
-from rotary_embedding import rotary_embedding_inplace
+from lm_ops import packed_attention, kv_single_query_attention, rotary_embedding_inplace
 
 
 class RotaryEmbedding(nn.Module):
@@ -99,7 +97,7 @@ class PhiAttention(nn.Module):
         if prompt_init:
             k_cache[cache_indices] = k
             v_cache[cache_indices] = v
-            s, p, o = paged_attention_forward(q, k, v, offsets, self.num_heads)
+            s, p, o = packed_attention(q, k, v, offsets, self.num_heads)
         else:
             if new_cache_indices is None:
                 raise IndexError("if prompt init is False, "
@@ -109,7 +107,7 @@ class PhiAttention(nn.Module):
                 return
             if k.mean() == torch.nan:
                 return
-            s, p, o = paged_kv_attention_forward(q, k, v,
+            s, p, o = kv_single_query_attention(q, k, v,
                                                  k_cache, v_cache,
                                                  cache_indices,
                                                  offsets,

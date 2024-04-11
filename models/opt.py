@@ -9,8 +9,8 @@ import torch
 from torch import nn
 import numpy as np
 from transformers import AutoTokenizer
-
-from paged_attention import paged_attention_forward, paged_kv_attention_forward
+from os.path import join as pjoin
+from lm_ops import packed_attention, kv_single_query_attention, kv_multi_query_attention
 
 OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "facebook/opt-125m",
@@ -58,24 +58,31 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init=True, new_cache_indices=None):
+    def forward(self, h, k_cache, v_cache,
+                offsets, cache_indices,
+                prompt_init=True,
+                new_cache_indices=None,
+                multi_query_multi_cache=False):
         q = self.q_proj(h)
         k = self.k_proj(h)
         v = self.v_proj(h)
         # prompt init일 때랑 아닐 때랑 offsets, cache_indices의 목적이 다름
-        if prompt_init:
+        if multi_query_multi_cache is True:
+            s, p, o = kv_multi_query_attention(q, k, v,
+                                               k_cache, v_cache,
+                                               cache_indices,
+                                               offsets,
+                                               self.num_heads)
+
+        elif prompt_init:
             k_cache[cache_indices] = k
             v_cache[cache_indices] = v
-            s, p, o = paged_attention_forward(q, k, v, offsets, self.num_heads)
+            s, p, o = packed_attention(q, k, v, offsets, self.num_heads)
         else:
             if new_cache_indices is None:
                 raise IndexError("if prompt init is False, "
                                  "new_cache_inidces must be given.")
-            if q.mean() == torch.nan:
-                return
-            if k.mean() == torch.nan:
-                return
-            s, p, o = paged_kv_attention_forward(q, k, v,
+            s, p, o = kv_single_query_attention(q, k, v,
                                                  k_cache, v_cache,
                                                  cache_indices,
                                                  offsets,
@@ -100,11 +107,17 @@ class OPTLayer(nn.Module):
         self.fc2 = nn.Linear(self.ffn_dim, self.embed_dim, bias=bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, eps=1e-5)
 
-    def forward(self, h, k_cache, v_cache, offsets, cache_indices, prompt_init, new_cache_indices=None):
+    def forward(self, h, k_cache, v_cache, offsets,
+                cache_indices, prompt_init,
+                new_cache_indices=None, multi_query_multi_cache=False):
         r = h
         if self.do_layer_norm_before:
             h = self.self_attn_layer_norm(h)
-        h = self.self_attn(h, k_cache, v_cache, offsets, cache_indices, prompt_init, new_cache_indices)
+        h = self.self_attn(h, k_cache, v_cache, offsets,
+                           cache_indices,
+                           prompt_init,
+                           new_cache_indices,
+                           multi_query_multi_cache)
 
         h = r + h
         if not self.do_layer_norm_before: # 350m do layer norm after attention
@@ -164,16 +177,17 @@ class OPTDecoder(nn.Module):
                 offsets,
                 cache_indices,
                 prompt_init=True,
-                new_cache_indices=None):
+                new_cache_indices=None,
+                multi_query_multi_cache=False):
         emb = self.embed_tokens(input_ids)
         pos = self.position_tokens(positions)
         if self.proj_in is not None:
             emb = self.proj_in(emb)
         h = emb + pos
-
         for i in range(self.num_hidden_layers):
             h = self.layers[i](h, k_cache[i], v_cache[i],
-                               offsets, cache_indices, prompt_init, new_cache_indices)
+                               offsets, cache_indices, prompt_init,
+                               new_cache_indices, multi_query_multi_cache)
 
         if self.final_layer_norm is not None:
             h = self.final_layer_norm(h)
@@ -182,7 +196,10 @@ class OPTDecoder(nn.Module):
 
         if prompt_init:
             h = h[offsets - 1]
-        ret = torch.matmul(model.embed_tokens.weight.data, h.T).T
+        if multi_query_multi_cache is False:
+            ret = torch.matmul(self.embed_tokens.weight.data, h.T).T
+        else:
+            ret = torch.matmul(self.embed_tokens.weight.data, h.permute(0, 2, 1)).permute(0, 2, 1)
         return ret
 
 
@@ -195,9 +212,10 @@ class OPTDecoder(nn.Module):
                       'decoder.project_in.weight',
                       'lm_head.weight'
                       ]
-        model_dict = torch.load(pjoin(model_path, "pytorch_model.bin"))
+        _model_dict = torch.load(pjoin(model_path, "pytorch_model.bin"))
         model_config = json.load(open(pjoin(model_path, "config.json"), 'r'))
-
+        model_dict = {k.replace("model.", ""):v for (k, v) in _model_dict.items()}
+        del _model_dict
         if self.word_embed_proj_dim != self.hidden_size:
             self.proj_in.weight.data = model_dict["decoder.project_in.weight"].cuda()
             self.proj_out.weight.data = model_dict["decoder.project_out.weight"].cuda()
@@ -270,10 +288,10 @@ if __name__ == "__main__":
     from os.path import join as pjoin
     import os
     import time
-    from models.sampler import Sampler
+    from sampler import Sampler
     s = Sampler(k=50, p=0.9, t=1.0)
 
-    model_name = "opt-350m"
+    model_name = "opt-125m"
     with open(pjoin(model_name, "config.json"), 'r') as f:
         config = json.load(f)
     model = OPTDecoder(config)
@@ -281,8 +299,8 @@ if __name__ == "__main__":
     model = model.cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    v_cache = [torch.zeros(8192, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
-    k_cache = [torch.zeros(8192, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    v_cache = [torch.zeros(1024, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
+    k_cache = [torch.zeros(1024, config["hidden_size"]).to(torch.float16).cuda() for _ in range(config["num_hidden_layers"])]
 
     sentences = [
         "Seoul is a city",
@@ -318,7 +336,7 @@ if __name__ == "__main__":
         print("====================================================")
 
     # # handle single token id at the generation stage
-    for i in range(1):
+    for i in range(64):
         new_token_ids = sampled_tokens
         def build_generation_input(sampled_tokens, list_of_cache_indices):
             new_positions = [len(x) for x in list_of_cache_indices]
@@ -343,7 +361,6 @@ if __name__ == "__main__":
         print("sampled tokens", sampled_tokens)
         de = tokenizer.batch_decode(sampled_tokens)
         _nc = new_cache_indices.cpu().numpy().tolist()
-        break
         os.system("clear")
         for i in range(len(sentences)):
             cache_indices[i].append(_nc[i])
