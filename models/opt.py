@@ -68,12 +68,13 @@ class OPTAttention(nn.Module):
         v = self.v_proj(h)
         # prompt init일 때랑 아닐 때랑 offsets, cache_indices의 목적이 다름
         if multi_query_multi_cache is True:
+            k_cache[new_cache_indices] = k
+            v_cache[new_cache_indices] = v
             s, p, o = kv_multi_query_attention(q, k, v,
                                                k_cache, v_cache,
                                                cache_indices,
                                                offsets,
                                                self.num_heads)
-
         elif prompt_init:
             k_cache[cache_indices] = k
             v_cache[cache_indices] = v
@@ -82,13 +83,13 @@ class OPTAttention(nn.Module):
             if new_cache_indices is None:
                 raise IndexError("if prompt init is False, "
                                  "new_cache_inidces must be given.")
+            k_cache[new_cache_indices] = k
+            v_cache[new_cache_indices] = v
             s, p, o = kv_single_query_attention(q, k, v,
                                                  k_cache, v_cache,
                                                  cache_indices,
                                                  offsets,
                                                  self.num_heads)
-            k_cache[new_cache_indices] = k
-            v_cache[new_cache_indices] = v
         o_proj = self.out_proj(o)
         return o_proj
 
@@ -170,6 +171,8 @@ class OPTDecoder(nn.Module):
                 for _ in range(self.num_hidden_layers)
             ]
         )
+        self.k_buffer = []
+        self.v_buffer = []
 
     def forward(self,
                 input_ids, positions,
@@ -179,6 +182,11 @@ class OPTDecoder(nn.Module):
                 prompt_init=True,
                 new_cache_indices=None,
                 multi_query_multi_cache=False):
+
+        if multi_query_multi_cache:
+            self.k_buffer = []
+            self.v_buffer = []
+
         emb = self.embed_tokens(input_ids)
         pos = self.position_tokens(positions)
         if self.proj_in is not None:
